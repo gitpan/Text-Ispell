@@ -2,7 +2,8 @@
 
 $| = 1;
 
-use Text::Ispell qw( spellcheck );
+use lib qw( lib );
+use Text::Ispell qw( :all );
 
 use Getopt::Std;
 
@@ -11,11 +12,18 @@ use strict;
 my %options;
 getopts( "hv", \%options );
 $options{'h'} and die "Usage: $0 [-v] [<] inputfile\n-v : verbose; report on every term\n";
-$options{'v'} or Text::Ispell::terse_mode();
+$options{'v'} or Text::Ispell::terse_mode(1);
 
 while ( <> ) {
   chomp;
   my $line = $_;
+
+  if ( s/^-C\s*// ) { allow_compounds(1); next; }
+  if ( s/^-m\s*// ) { infer_root_affix_combos(1); next; }
+  if ( s/^-d\s*// ) { use_dictionaries(split); next; }
+  if ( s/^-p\s*// ) { use_personal_dictionaries(split); next; }
+
+
   for my $r ( spellcheck( $line ) ) {
 
     {

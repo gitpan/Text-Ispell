@@ -1,7 +1,9 @@
 
+#(@) Text::Ispell.pm - a module encapsulating access to the Ispell program.
+
 =head1 NAME
 
-Text::Ispell.pm - a class encapsulating access to the Ispell program.
+Text::Ispell.pm - a module encapsulating access to the Ispell program.
 
 =cut
 
@@ -18,7 +20,13 @@ use Exporter;
   set_params_by_language
   save_dictionary
   terse_mode
-  nonterse_mode
+  allow_compounds
+  make_wild_guesses
+  use_dictionaries
+  use_personal_dictionaries
+);
+%Text::Ispell::EXPORT_TAGS = (
+  'all' => \@Text::Ispell::EXPORT_OK,
 );
 
 
@@ -29,7 +37,7 @@ use Carp;
 use strict;
 
 use vars qw( $VERSION );
-$VERSION = '0.03';
+$VERSION = '0.04';
 
 
 =head1 SYNOPSIS
@@ -42,7 +50,7 @@ $VERSION = '0.03';
  spellcheck( $string );
 
  # Useful:
- use Text::Ispell qw( spellcheck );
+ use Text::Ispell qw( :all );  # import all symbols
  for my $r ( spellcheck( "hello hacking perl shrdlu 42" ) ) {
    print "$r->{'type'}: $r->{'term'}\n";
  }
@@ -86,7 +94,8 @@ scanning the dictionary.
 A quickie example:
 
  use Text::Ispell qw( spellcheck );
- for my $r ( spellcheck( "hello hacking perl shrdlu 42" ) ) {
+ Text::Ispell::allow_compounds(1);
+ for my $r ( spellcheck( "hello hacking perl salmoning fruithammer shrdlu 42" ) ) {
    if ( $r->{'type'} eq 'ok' ) {
      # as in the case of 'hello'
      print "'$r->{'term'}' was found in the dictionary.\n";
@@ -100,15 +109,21 @@ A quickie example:
      print "'$r->{'term'}' was not found in the dictionary;\n";
      print "Near misses: $r->{'misses'}\n";
    }
+   elsif ( $r->{'type'} eq 'guess' ) {
+     # as in the case of 'salmoning'
+     print "'$r->{'term'}' was not found in the dictionary;\n";
+     print "Root/affix Guesses: $r->{'guesses'}\n";
+   }
+   elsif ( $r->{'type'} eq 'compound' ) {
+     # as in the case of 'fruithammer'
+     print "'$r->{'term'}' is a valid compound word.\n";
+   }
    elsif ( $r->{'type'} eq 'none' ) {
      # as in the case of 'shrdlu'
      print "No match for term '$r->{'term'}'\n";
    }
+   # and numbers are skipped entirely, as in the case of 42.
  }
-
-According to the ispell man page, there should be two more types:
-compound and guess.  However, I have not figured out how to elicit
-responses of these types from ispell.
 
 
 =head2 ERRORS
@@ -129,14 +144,27 @@ in the variable C<$Text::Ispell::path>.  The default
 value is F</usr/local/bin/ispell>.
 If your ispell executable has some name other than
 this, then you must set C<$Text::Ispell::path> accordingly
-before you call C<Text::Ispell::spellcheck()> for the first
-time.
+before you call C<Text::Ispell::spellcheck()> (or any other function
+in the module) for the first time!
 
 =cut
 
 
 sub _init {
   unless ( $Text::Ispell::pid ) {
+    my @options;
+    while ( my( $k, $ar ) = each %Text::Ispell::options ) {
+      if ( @$ar ) {
+	for ( @$ar ) {
+          #push @options, "$k $_";
+          push @options, $k, $_;
+	}
+      }
+      else {
+        push @options, $k;
+      }
+    }
+
     $Text::Ispell::path ||= '/usr/local/bin/ispell';
 
     $Text::Ispell::pid = undef; # so that it's still undef if open2 fails.
@@ -145,6 +173,7 @@ sub _init {
       *Writer,
       $Text::Ispell::path,
       '-a', '-S',
+      @options,
     );
 
     my $hdr = scalar(<Reader>);
@@ -155,10 +184,6 @@ sub _init {
   $Text::Ispell::pid
 }
 
-#
-# we'll need this if we implement features that need to
-# stop and re-start the coprocess.
-#
 sub _exit {
   if ( $Text::Ispell::pid ) {
     close Reader;
@@ -267,19 +292,11 @@ sub _send_command($$) {
 }
 
 
-#
-# these add_word commands apparently add the word
-# to the dictionary whose persistence is in the
-# file "$HOME/.ispell_english".
-# I'll bet the "english" part is variable, and
-# depends on the current language.
-#
-
 =head1 AUX FUNCTIONS
 
 =head2 add_word(word)
 
-Adds a word to the dictionary.  Be careful of capitalization.
+Adds a word to the personal dictionary.  Be careful of capitalization.
 If you want the word to be added "case-insensitively", you should
 call C<add_word_lc()>
 
@@ -291,8 +308,8 @@ sub add_word($) {
 
 =head2 add_word_lc(word)
 
-Adds a word to the dictionary, in lower-case form.  This allows
-ispell to match it in a case-insensitive manner.
+Adds a word to the personal dictionary, in lower-case form. 
+This allows ispell to match it in a case-insensitive manner.
 
 =cut
 
@@ -305,7 +322,8 @@ sub add_word_lc($) {
 Similar to adding a word to the dictionary, in that it causes
 ispell to accept the word as valid, but it does not actually
 add it to the dictionary.  Presumably the effects of this only
-last for the current ispell session.
+last for the current ispell session, which will mysteriously
+end if any of the coprocess-restarting functions are called...
 
 =cut
 
@@ -351,9 +369,7 @@ sub save_dictionary() {
   _send_command "\#", '';
 }
 
-=head2 terse_mode()
-
-=head2 nonterse_mode()
+=head2 terse_mode(bool:terse)
 
 In terse mode, ispell will not produce reports for "correct" words.
 This means that the calling program will not receive results of the
@@ -364,52 +380,147 @@ all terms, not just "incorrect" ones.
 
 =cut
 
-sub terse_mode() {
-  _send_command "\!", '';
-  $Text::Ispell::terse = 1;
+sub terse_mode($) {
+  my $bool = shift;
+  my $cmd = $bool ?  "\!" : "\%";
+  _send_command $cmd, '';
+  $Text::Ispell::terse = $bool;
 }
 
-sub nonterse_mode() {
-  _send_command "\%", '';
-  $Text::Ispell::terse = 0;
+
+=head1 FUNCTIONS THAT RESTART ISPELL
+
+The following functions cause the current ispell coprocess, if any, to terminate. 
+This means that all the changes to the state of ispell made by the above
+functions will be lost, and their respective values reset to their defaults.
+The only function above whose effect is persistent is C<save_dictionary()>.
+
+Perhaps in the future we will figure out a good way to make this
+state information carry over from one instantiation of the coprocess
+to the next.
+
+=head2 allow_compounds(bool)
+
+When this value is set to True, compound words are
+accepted as legal -- as long as both words are found in the
+dictionary; more than two words are always illegal.
+When this value is set to False, run-together words are
+considered spelling errors.
+
+The default value of this setting is dictionary-dependent,
+so the caller should set it explicitly if it really matters.
+
+=cut
+
+sub allow_compounds {
+  my $bool = shift;
+  _exit();
+  if ( $bool ) {
+    $Text::Ispell::options{'-C'} = [];
+    delete $Text::Ispell::options{'-B'};
+  }
+  else {
+    $Text::Ispell::options{'-B'} = [];
+    delete $Text::Ispell::options{'-C'};
+  }
 }
+
+=head2 make_wild_guesses(bool)
+
+This setting controls when ispell makes "wild" guesses.
+
+If False, ispell only makes "sane" guesses, i.e.  possible
+root/affix combinations that match the current dictionary;
+only if it can find none will it make "wild" guesses,
+which don't match the dictionary, and might in fact
+be illegal words.
+
+If True, wild guesses are always made, along with any "sane" guesses. 
+This feature can be useful if the dictionary has a limited word list,
+or a word list with few suffixes. 
+
+The default value of this setting is dictionary-dependent,
+so the caller should set it explicitly if it really matters.
+
+=cut
+
+sub make_wild_guesses {
+  my $bool = shift;
+  _exit();
+  if ( $bool ) {
+    $Text::Ispell::options{'-m'} = [];
+    delete $Text::Ispell::options{'-P'};
+  }
+  else {
+    $Text::Ispell::options{'-P'} = [];
+    delete $Text::Ispell::options{'-m'};
+  }
+}
+
+=head2 use_dictionary([dictionary])
+
+Specifies what dictionary to use instead of the
+default.  Dictionary names are actually file
+names, and are searched for according to the
+following rule: if the name does not contain a slash,
+it is looked for in the directory containing the
+default dictionary, typically /usr/local/lib.
+Otherwise, it is used as is: if it does not begin
+with a slash, it is construed from the current
+directory.
+
+If no argument is given, the default dictionary will be used.
+
+=cut
+
+sub use_dictionary($) {
+  _exit();
+  if ( @_ ) {
+    $Text::Ispell::options{'-d'} = [ @_ ];
+  }
+  else {
+    delete $Text::Ispell::options{'-d'};
+  }
+}
+
+=head2 use_personal_dictionary([dictionary])
+
+Specifies what personal dictionary to use
+instead of the default.
+
+Dictionary names are actually file names, and are
+searched for according to the following rule:
+if the name begins with a slash, it is used as
+is (i.e. it is an absolute path name). Otherwise,
+it is construed as relative to the user's home
+directory ($HOME).
+
+If no argument is given, the default personal
+dictionary will be used.
+
+=cut
+
+sub use_personal_dictionary($) {
+  _exit();
+  if ( @_ ) {
+    $Text::Ispell::options{'-p'} = [ @_ ];
+  }
+  else {
+    delete $Text::Ispell::options{'-p'};
+  }
+}
+
 
 
 1;
 
 
-=head1 LIMITATIONS
-
-Currently this package assumes, and only supports, the default language,
-i.e. English.  It does not provide access to the features of ispell
-which allow the selection of alternate languages or dictionaries.
-
 =head1 FUTURE ENHANCEMENTS
 
-Take advantage of these ispell options:
-
-  -d file
-       Specify an alternate dictionary file.
-       For example, use -d deutsch to choose a German dictionary.
-
-  -p file
-       Specify an alternate personal dictionary.
+ispell options:
 
   -w chars
        Specify additional characters that can be part of a word.
-
-  -B   Report run-together words with missing  blanks  as
-       spelling errors.
-
-  -C   Consider run-together words as legal compounds.
-
-  -P   Don't generate extra root/affix combinations.
-
-  -m   Make possible root/affix combinations that  aren't
-       in the dictionary.
-
-I should consider allowing these kinds of options to be set at
-any time; this would entail stopping and restarting the coprocess.
 
 =head1 DEPENDENCIES
 
